@@ -28,12 +28,7 @@ public class PlayerCombat : MonoBehaviour
     public void SetIntendedTarget(Transform target) { intendedTarget = target; }
     public void ReportSuccessfulHit() { currentAttackHasHit = true; }
     public void ResetHitConfirmation() { currentAttackHasHit = false; }
-    public void ResetLightCombo()
-    {
-        lightAttackChainIndex = 0;
-        Debug.LogWarning("!!! COMBO RESET !!! La chaîne d'attaques légères a été réinitialisée.", this.gameObject);
-        Debug.Log(Environment.StackTrace); // Affiche la pile d'appels complète
-    }
+    public void ResetLightCombo() { lightAttackChainIndex = 0; }
 
     // --- GESTION DES INPUTS (appelée par PlayerController) ---
     public void OnLightAttack() => HandleAttackInput(AttackInputType.Light);
@@ -44,9 +39,14 @@ public class PlayerCombat : MonoBehaviour
     public void StartAttackHitbox() => currentWeapon?.EnableHitbox(intendedTarget);
     public void EndAttackHitbox() => currentWeapon?.DisableHitbox();
 
-    // AttackFinished() appelée automatiquement dans AttackStateBehavior.cs
-    public void AttackFinished()
+    // AttackFinished() appelée en event à la fin des animations
+    public void AttackFinished(int finishedAttackIndex)
     {
+        // si l'appel vient de l'event de l'animation d'attaque précédente, on annule
+        if (finishedAttackIndex < lightAttackChainIndex)
+        {
+            return;
+        }
         // Avant de retourner à l'état neutre, on vérifie si un coup lourd a été demandé.
         if (bufferedInput.HasValue && bufferedInput.Value == AttackInputType.Heavy)
         {
@@ -55,7 +55,6 @@ public class PlayerCombat : MonoBehaviour
         }
         else
         {
-            Debug.Log("COMBOFINI");
             // Sinon, le combo est vraiment fini.
             player.ActionStateMachine.ChangeState(player.ReadyState);
             bufferedInput = null;
@@ -155,9 +154,9 @@ public class PlayerCombat : MonoBehaviour
         if (input == AttackInputType.Light)
         {
             Debug.Log("Executing attack n. " + lightAttackChainIndex);
+            lightAttackChainIndex++;
             player.ChainAttackState.SetAttack(attackToExecute, target);
             player.ActionStateMachine.ChangeState(player.ChainAttackState);
-            lightAttackChainIndex++;
         }
         else if (input == AttackInputType.Heavy)
         {
