@@ -1,170 +1,172 @@
-// PlayerCombat.cs
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
+using System.Collections;
+using System.Linq;
 
 public class PlayerCombat : MonoBehaviour
 {
-    private PlayerController player; // Référence au coordinateur
+    private PlayerController player;
 
-    [Header("Weapon & Combat")]
+    [Header("Weapon & Combat Stats")]
     public Weapon currentWeapon;
-    public float lungeSpeed = 5f;
+    public float lungeSpeed = 15f;
+    [Tooltip("La durée en secondes de la fenêtre de tolérance après la fin d'une animation d'attaque réussie.")]
+    public float comboLeniency = 0.2f;
 
-    private Transform intendedTarget;
-
-    private bool isComboWindowOpen = false;
-    private bool currentAttackHasHit = false;
-    private AttackInputType? bufferedInput = null;
+    // Variables d'état internes pour la gestion des combos
     private int lightAttackChainIndex = 0;
+    private AttackInputType? bufferedInput = null;
+    private bool currentAttackHasHit = false;
+    private Coroutine comboResetCoroutine;
+    private Transform intendedTarget;
 
     private void Awake()
     {
         player = GetComponent<PlayerController>();
     }
 
-    // --- API PUBLIQUE (appelée par d'autres scripts) ---
-    public void SetIntendedTarget(Transform target) { intendedTarget = target; }
-    public void ReportSuccessfulHit() { currentAttackHasHit = true; }
-    public void ResetHitConfirmation() { currentAttackHasHit = false; }
-    public void ResetLightCombo() { lightAttackChainIndex = 0; }
+    #region --- Gestion des Inputs (Appelé par PlayerController) ---
 
-    // --- GESTION DES INPUTS (appelée par PlayerController) ---
     public void OnLightAttack() => HandleAttackInput(AttackInputType.Light);
     public void OnHeavyAttack() => HandleAttackInput(AttackInputType.Heavy);
 
-    // --- GESTION DES ANIMATION EVENTS
-    // Ces méthodes appellent l'arme qui se charge d'activer/désactiver sa propre hitbox.
-    public void StartAttackHitbox() => currentWeapon?.EnableHitbox(intendedTarget);
-    public void EndAttackHitbox() => currentWeapon?.DisableHitbox();
-
-    // AttackFinished() appelée en event à la fin des animations
-    public void AttackFinished(int finishedAttackIndex)
-    {
-        // si l'appel vient de l'event de l'animation d'attaque précédente, on annule
-        if (finishedAttackIndex < lightAttackChainIndex)
-        {
-            return;
-        }
-        // Avant de retourner à l'état neutre, on vérifie si un coup lourd a été demandé.
-        if (bufferedInput.HasValue && bufferedInput.Value == AttackInputType.Heavy)
-        {
-            bufferedInput = null; // On consomme l'input
-            ExecuteAttack(AttackInputType.Heavy, null); // On lance l'attaque lourde
-        }
-        else
-        {
-            // Sinon, le combo est vraiment fini.
-            player.ActionStateMachine.ChangeState(player.ReadyState);
-            bufferedInput = null;
-            ResetLightCombo();
-        }
-    }
-
-    public void OpenComboWindow()
-    {
-        isComboWindowOpen = true;
-        if (bufferedInput.HasValue)
-        {
-            HandleAttackInput(bufferedInput.Value);
-            bufferedInput = null;
-        }
-    }
-
-    public void CloseComboWindow()
-    {
-        if (isComboWindowOpen == false) return;
-
-        isComboWindowOpen = false;
-        bufferedInput = null;
-        ResetLightCombo();
-    }
-
-    // --- LOGIQUE CENTRALE (Le Cerveau du Combat)
-
-    // Point d'entrée unique pour gérer toutes les demandes d'attaque.
     private void HandleAttackInput(AttackInputType input)
     {
         if (currentWeapon == null) return;
 
-        // --- CAS 1 : On continue un combo léger ---
-        if (input == AttackInputType.Light && isComboWindowOpen && currentAttackHasHit)
-        {
-            var chain = currentWeapon.weaponData.lightAttackChain;
-            if (chain.Count == 0) return;
-
-            // On prend l'index de la PROCHAINE attaque pour connaître sa portée de ciblage
-            int nextIndex = lightAttackChainIndex >= chain.Count ? 0 : lightAttackChainIndex;
-            AttackProfile nextAttackProfile = chain[nextIndex];
-            float targetingRange = currentWeapon.weaponData.GetTargetingRange(nextAttackProfile);
-
-            // On trouve la cible avec la logique de redirection
-            Vector3 moveDirection = player.MoveInput != Vector2.zero ? new Vector3(player.MoveInput.x, 0, player.MoveInput.y).normalized : player.transform.forward;
-            Transform target = player.Targeting.FindComboTarget(targetingRange, moveDirection);
-
-            ExecuteAttack(AttackInputType.Light, target);
-            return;
-        }
-
-        // --- CAS 2 : On commence une nouvelle attaque depuis l'état neutre ---
-        if (player.ActionStateMachine.CurrentState is PlayerReadyState)
-        {
-            Transform target = null;
-            if (input == AttackInputType.Light)
-            {
-                ResetLightCombo();
-                var chain = currentWeapon.weaponData.lightAttackChain;
-                if (chain.Count == 0) return;
-                // On prend la portée de la PREMIÈRE attaque de la chaîne
-                AttackProfile firstAttackProfile = chain[0];
-                float engagementRange = currentWeapon.weaponData.GetTargetingRange(firstAttackProfile);
-                target = player.Targeting.FindInitialTarget(engagementRange);
-            }
-            ExecuteAttack(input, target);
-            return;
-        }
-        // --- CAS 3 : On n'est dans aucune des situations ci-dessus, on bufférise l'input ---
-        if (!isComboWindowOpen)
+        // Si on est déjà dans un état d'attaque, on met simplement l'input en mémoire tampon.
+        if (player.ActionStateMachine.CurrentState is not PlayerReadyState)
         {
             bufferedInput = input;
+            return;
         }
+
+        // Si on est prêt, on lance directement une nouvelle chaîne d'attaques.
+        ExecuteAttack(input, null);
     }
 
-    // Exécute l'attaque demandée avec la cible fournie. Ne réfléchit plus, ne fait qu'agir.
+    #endregion
+
+    #region --- Logique de Combo (Le Cerveau) ---
+
     private void ExecuteAttack(AttackInputType input, Transform target)
     {
+        // On a lancé une nouvelle attaque, on annule donc tout timer de reset de combo.
+        if (comboResetCoroutine != null)
+        {
+            StopCoroutine(comboResetCoroutine);
+        }
+
+        bufferedInput = null;
+        currentAttackHasHit = false;
+
         AttackProfile attackToExecute = null;
         if (input == AttackInputType.Light)
         {
             var chain = currentWeapon.weaponData.lightAttackChain;
-            if (lightAttackChainIndex >= chain.Count) lightAttackChainIndex = 0;
+            if (lightAttackChainIndex >= chain.Count)
+            {
+                ResetLightCombo(); // Si on est au bout de la chaîne, on recommence.
+            }
             attackToExecute = chain[lightAttackChainIndex];
         }
         else if (input == AttackInputType.Heavy)
         {
             attackToExecute = currentWeapon.weaponData.heavyAttackChain.FirstOrDefault();
+            ResetLightCombo(); // Une attaque lourde brise la chaîne d'attaques légères.
         }
 
-        if (attackToExecute == null) return;
+        if (attackToExecute == null) { ResetAndGoToReadyState(); return; }
+
+        // Si aucune cible n'a été fournie, on en cherche une.
+        if (target == null)
+        {
+            float range = currentWeapon.weaponData.GetTargetingRange(attackToExecute);
+            // On se base sur la direction du stick si le joueur bouge, sinon sur la direction du personnage.
+            Vector3 desiredDirection = player.MoveInput.magnitude > 0.1f ? new Vector3(player.MoveInput.x, 0, player.MoveInput.y) : player.transform.forward;
+            target = player.Targeting.FindComboTarget(range, desiredDirection);
+        }
 
         SetIntendedTarget(target);
         currentWeapon.SetCurrentAttack(attackToExecute);
 
+        // On passe à l'état d'attaque correspondant
         if (input == AttackInputType.Light)
         {
-            Debug.Log("Executing attack n. " + lightAttackChainIndex);
-            lightAttackChainIndex++;
             player.ChainAttackState.SetAttack(attackToExecute, target);
             player.ActionStateMachine.ChangeState(player.ChainAttackState);
+            lightAttackChainIndex++; // On prépare l'index pour le PROCHAIN coup de la chaîne.
         }
         else if (input == AttackInputType.Heavy)
         {
             player.ActionStateMachine.ChangeState(player.HeavyAttackState);
         }
-
-        bufferedInput = null;
-        isComboWindowOpen = false;
-        ResetHitConfirmation();
     }
+
+    // Appelée par la WeaponHitbox quand un coup touche. C'est le coeur du Hit-Confirm.
+    public void ReportSuccessfulHit()
+    {
+        if (currentAttackHasHit) return;
+
+        currentAttackHasHit = true;
+        Debug.Log("HIT CONFIRMED!");
+
+        // Si un coup est en attente dans le buffer, on l'exécute IMMÉDIATEMENT.
+        if (bufferedInput.HasValue)
+        {
+            ExecuteAttack(bufferedInput.Value, null);
+        }
+    }
+
+    #endregion
+
+    #region --- Événements d'Animation & Reset ---
+
+    // Appelée par un Animation Event à la fin de chaque animation d'attaque.
+    public void OnAnimationFinished()
+    {
+        // On annule tout timer qui aurait pu être lancé par une attaque précédente
+        if (comboResetCoroutine != null) StopCoroutine(comboResetCoroutine);
+
+        // CAS 1 : Le coup a raté. Le combo est brisé.
+        if (!currentAttackHasHit)
+        {
+            ResetAndGoToReadyState();
+            return;
+        }
+
+        // CAS 2 : Le coup a touché, mais le joueur n'a pas encore enchaîné via ReportSuccessfulHit.
+        // On lui donne une dernière chance en lançant le timer de tolérance.
+        comboResetCoroutine = StartCoroutine(ResetComboAfterDelay(comboLeniency));
+    }
+
+    // Le timer de la fenêtre de tolérance.
+    private IEnumerator ResetComboAfterDelay(float delay)
+    {
+        yield return new WaitForSeconds(delay);
+        ResetAndGoToReadyState();
+    }
+
+    // La fonction de nettoyage finale pour retourner à l'état neutre.
+    private void ResetAndGoToReadyState()
+    {
+        bufferedInput = null;
+        player.ActionStateMachine.ChangeState(player.ReadyState);
+        ResetLightCombo();
+    }
+
+    public void ResetLightCombo()
+    {
+        lightAttackChainIndex = 0;
+    }
+
+    public void SetIntendedTarget(Transform target)
+    {
+        intendedTarget = target;
+    }
+
+    // Fonctions appelées par les Animation Events pour la hitbox
+    public void StartAttackHitbox() => currentWeapon?.EnableHitbox(intendedTarget);
+    public void EndAttackHitbox() => currentWeapon?.DisableHitbox();
+
+    #endregion
 }
